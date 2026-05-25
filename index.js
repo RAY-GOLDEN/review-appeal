@@ -38,13 +38,13 @@ async function initDB() {
 }
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
+app.use(cors({ origin: [process.env.CLIENT_URL || "http://localhost:5173", "https://review-appeal-frontend.onrender.com"], credentials: true }));
 app.use(express.json());
 app.use(session({
   secret: process.env.SESSION_SECRET || "dev-secret-change-in-prod",
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: process.env.NODE_ENV === "production", httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000 }
+  cookie: { secure: true, httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000, sameSite: "none" }
 }));
 
 // ─── GOOGLE OAUTH ─────────────────────────────────────────────────────────────
