@@ -1,13 +1,14 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const session = require("express-session");
 const { google } = require("googleapis");
 const Anthropic = require("@anthropic-ai/sdk");
 const { Pool } = require("pg");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.SESSION_SECRET || "dev-secret-change-in-prod";
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
 const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -38,14 +39,14 @@ async function initDB() {
 }
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: [process.env.CLIENT_URL || "http://localhost:5173", "https://review-appeal-frontend.onrender.com"], credentials: true }));
-app.use(express.json());
-app.use(session({
-  secret: process.env.SESSION_SECRET || "dev-secret-change-in-prod",
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: true, httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000, sameSite: "none" }
+app.use(cors({
+  origin: [
+    process.env.CLIENT_URL || "http://localhost:5173",
+    "https://review-appeal-frontend.onrender.com"
+  ],
+  credentials: true
 }));
+app.use(express.json());
 
 // ─── GOOGLE OAUTH ─────────────────────────────────────────────────────────────
 function getOAuthClient() {
@@ -62,15 +63,21 @@ const SCOPES = [
   "https://www.googleapis.com/auth/business.manage"
 ];
 
-// Auth middleware
+// Auth middleware — JWT based
 function requireAuth(req, res, next) {
-  if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
-  next();
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer ")) return res.status(401).json({ error: "Not authenticated" });
+  try {
+    const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+    req.userId = payload.userId;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
 }
 
 // ─── ROUTES: AUTH ─────────────────────────────────────────────────────────────
 
-// Step 1 — redirect user to Google consent screen
 app.get("/auth/google", (req, res) => {
   const oauth2Client = getOAuthClient();
   const url = oauth2Client.generateAuthUrl({
@@ -81,21 +88,19 @@ app.get("/auth/google", (req, res) => {
   res.redirect(url);
 });
 
-// Step 2 — Google redirects back with ?code=
 app.get("/auth/callback", async (req, res) => {
   const { code, error } = req.query;
-  if (error) return res.redirect(`${process.env.CLIENT_URL}/?error=auth_denied`);
+  const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
+  if (error) return res.redirect(`${clientUrl}/?error=auth_denied`);
 
   try {
     const oauth2Client = getOAuthClient();
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
 
-    // Get user info
     const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
     const { data: userInfo } = await oauth2.userinfo.get();
 
-    // Upsert user in DB
     const result = await db.query(
       `INSERT INTO users (google_id, email, name, access_token, refresh_token)
        VALUES ($1, $2, $3, $4, $5)
@@ -105,35 +110,37 @@ app.get("/auth/callback", async (req, res) => {
       [userInfo.id, userInfo.email, userInfo.name, tokens.access_token, tokens.refresh_token]
     );
 
-    req.session.userId = result.rows[0].id;
-    res.redirect(`${process.env.CLIENT_URL}/dashboard`);
+    const userId = result.rows[0].id;
+    const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
+
+    // Redirect to frontend with token in URL
+    res.redirect(`${clientUrl}/dashboard?token=${token}`);
   } catch (err) {
     console.error("OAuth callback error:", err.message);
-    res.redirect(`${process.env.CLIENT_URL}/?error=auth_failed`);
+    const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
+    res.redirect(`${clientUrl}/?error=auth_failed`);
   }
 });
 
 app.get("/auth/me", requireAuth, async (req, res) => {
-  const { rows } = await db.query("SELECT id, email, name FROM users WHERE id=$1", [req.session.userId]);
+  const { rows } = await db.query("SELECT id, email, name FROM users WHERE id=$1", [req.userId]);
   res.json(rows[0] || null);
 });
 
 app.post("/auth/logout", (req, res) => {
-  req.session.destroy(() => res.json({ ok: true }));
+  res.json({ ok: true });
 });
 
 // ─── ROUTES: REVIEWS ──────────────────────────────────────────────────────────
 
-// Get all locations for this user's Google Business account
 app.get("/api/locations", requireAuth, async (req, res) => {
   try {
-    const { rows } = await db.query("SELECT access_token, refresh_token FROM users WHERE id=$1", [req.session.userId]);
+    const { rows } = await db.query("SELECT access_token, refresh_token FROM users WHERE id=$1", [req.userId]);
     const user = rows[0];
 
     const oauth2Client = getOAuthClient();
     oauth2Client.setCredentials({ access_token: user.access_token, refresh_token: user.refresh_token });
 
-    // My Business Account Management API
     const mybusiness = google.mybusinessaccountmanagement({ version: "v1", auth: oauth2Client });
     const { data } = await mybusiness.accounts.list();
     const accounts = data.accounts || [];
@@ -156,22 +163,19 @@ app.get("/api/locations", requireAuth, async (req, res) => {
   }
 });
 
-// Fetch reviews for a location, filtered by threshold
 app.get("/api/reviews", requireAuth, async (req, res) => {
   const { locationName, threshold = 3 } = req.query;
   if (!locationName) return res.status(400).json({ error: "locationName is required" });
 
   try {
-    const { rows } = await db.query("SELECT access_token, refresh_token FROM users WHERE id=$1", [req.session.userId]);
+    const { rows } = await db.query("SELECT access_token, refresh_token FROM users WHERE id=$1", [req.userId]);
     const user = rows[0];
 
     const oauth2Client = getOAuthClient();
     oauth2Client.setCredentials({ access_token: user.access_token, refresh_token: user.refresh_token });
 
     const mybusiness = google.mybusinessreviews({ version: "v4", auth: oauth2Client });
-    const { data } = await mybusiness.accounts.locations.reviews.list({
-      parent: locationName
-    });
+    const { data } = await mybusiness.accounts.locations.reviews.list({ parent: locationName });
 
     const allReviews = data.reviews || [];
     const ratingMap = { ONE: 1, TWO: 2, THREE: 3, FOUR: 4, FIVE: 5 };
@@ -222,9 +226,8 @@ Google's valid removal reasons:
 Return ONLY valid JSON, no markdown:
 {
   "reason": "SPAM|FAKE|IRRELEVANT|HARASSMENT|PRIVATE_INFO",
-  "reason_he": "שם הסיבה בעברית",
   "confidence": "HIGH|MEDIUM|LOW",
-  "explanation_he": "הסבר קצר בעברית (1-2 משפטים)",
+  "explanation": "Short explanation in English (1-2 sentences)",
   "appeal_text": "Professional appeal text in English for Google (2-3 sentences, citing specific policy violation)",
   "policy_reference": "Which Google policy this violates"
 }`
@@ -235,12 +238,11 @@ Return ONLY valid JSON, no markdown:
     const clean = text.replace(/```json|```/g, "").trim();
     const analysis = JSON.parse(clean);
 
-    // Save analysis to DB
     await db.query(
       `INSERT INTO appeals (user_id, review_id, review_text, rating, reason, appeal_text, status)
        VALUES ($1, $2, $3, $4, $5, $6, 'analyzed')
        ON CONFLICT DO NOTHING`,
-      [req.session.userId, reviewId || "unknown", reviewText, rating, analysis.reason, analysis.appeal_text]
+      [req.userId, reviewId || "unknown", reviewText, rating, analysis.reason, analysis.appeal_text]
     );
 
     res.json({ success: true, analysis });
@@ -250,8 +252,6 @@ Return ONLY valid JSON, no markdown:
   }
 });
 
-// ─── ROUTES: SUBMIT APPEAL ────────────────────────────────────────────────────
-
 app.post("/api/appeal", requireAuth, async (req, res) => {
   const { locationName, reviewId, reason } = req.body;
   if (!locationName || !reviewId || !reason) {
@@ -259,37 +259,33 @@ app.post("/api/appeal", requireAuth, async (req, res) => {
   }
 
   try {
-    const { rows } = await db.query("SELECT access_token, refresh_token FROM users WHERE id=$1", [req.session.userId]);
+    const { rows } = await db.query("SELECT access_token, refresh_token FROM users WHERE id=$1", [req.userId]);
     const user = rows[0];
 
     const oauth2Client = getOAuthClient();
     oauth2Client.setCredentials({ access_token: user.access_token, refresh_token: user.refresh_token });
 
-    // Google My Business API — flag/report review
     const mybusiness = google.mybusinessreviews({ version: "v4", auth: oauth2Client });
     await mybusiness.accounts.locations.reviews.deleteReview({
       name: `${locationName}/reviews/${reviewId}`
     });
 
-    // Update DB status
     await db.query(
       "UPDATE appeals SET status='submitted', submitted_at=NOW() WHERE user_id=$1 AND review_id=$2",
-      [req.session.userId, reviewId]
+      [req.userId, reviewId]
     );
 
     res.json({ success: true, message: "Appeal submitted to Google" });
   } catch (err) {
     console.error("Appeal error:", err.message);
-    // Google doesn't always allow direct delete — flag it instead
     res.status(500).json({ error: "Appeal submission failed", detail: err.message });
   }
 });
 
-// History of submitted appeals
 app.get("/api/appeals/history", requireAuth, async (req, res) => {
   const { rows } = await db.query(
     "SELECT * FROM appeals WHERE user_id=$1 ORDER BY submitted_at DESC LIMIT 50",
-    [req.session.userId]
+    [req.userId]
   );
   res.json({ appeals: rows });
 });
