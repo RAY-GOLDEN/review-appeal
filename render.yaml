@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: review-appeal-api
+    env: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: review-appeal-db
+          property: connectionString
+      - key: CLIENT_URL
+        sync: false
+
+databases:
+  - name: review-appeal-db
+    databaseName: reviewappeal
+    user: reviewappeal
+    plan: free
